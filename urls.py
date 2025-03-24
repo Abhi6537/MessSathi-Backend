@@ -18,28 +18,37 @@ db.init_app(app)
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        if not token:
-            return jsonify({'message': 'Token is missing'}), 401
-        try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            current_user = User.query.get(data['user_id'])
-            if not current_user:
-                return jsonify({'message': 'User not found'}), 401
+        token = None
 
-            # Check if token is blacklisted
-            if BlacklistedToken.query.filter_by(token=token).first():
-                return jsonify({'message': 'Token has been revoked'}), 401
+        # Extract token from Authorization header
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]  # Get only the token part
+
+        if not token:
+            return jsonify({"message": "Token is missing"}), 401
+
+        try:
+            # Decode JWT
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            user_id = data.get("user_id")  # Ensure correct key
+
+            if not user_id:
+                return jsonify({"message": "Invalid token data"}), 401
+
+            # Find user in database
+            current_user = User.query.filter_by(id=user_id).first()
+            if not current_user:
+                return jsonify({"message": "User not found"}), 401
 
         except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token expired'}), 401
+            return jsonify({"message": "Token has expired"}), 401
         except jwt.InvalidTokenError:
-            return jsonify({'message': 'Invalid token'}), 401
-        
-        return f(current_user, *args, **kwargs)
-    
-    return decorated
+            return jsonify({"message": "Invalid token"}), 401
 
+        return f(current_user, *args, **kwargs)
+
+    return decorated
 
 
 @app.route('/')
@@ -158,3 +167,20 @@ def remove_saved_mess(current_user, id):
     db.session.delete(saved_mess)
     db.session.commit()
     return jsonify({'message': 'Mess removed from saved list'})
+
+
+@app.route('/api/auth/user', methods=['GET'])
+@token_required
+def fetch_user(current_user):
+    if not current_user:
+        return jsonify({'message': 'User not found'}), 404
+    
+    return jsonify({
+        'user': {
+            'name': current_user.name,
+            'id': current_user.id,
+            'email': current_user.email,
+            'phone': current_user.phone
+        }
+    }), 200
+
