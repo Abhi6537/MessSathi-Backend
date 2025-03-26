@@ -124,23 +124,93 @@ def create_mess(current_user):
     if current_user.user_type != UserType.OWNER:
         return jsonify({'message': 'Only owners can create mess listings'}), 403
     
-    data = request.json
-    new_mess = MessListing(
-        owner_id=current_user.id,
-        title=data['title'],
-        description=data['description'],
-        address=data['address'],
-        locality=data['locality'],
-        city=data['city'],
-        state=data['state'],
-        pincode=data['pincode'],
-        contact_phone=data['contact_phone'],
-        contact_email=data.get('contact_email'),
-        location=f"{data['location']['lat']},{data['location']['lng']}"
-    )
-    db.session.add(new_mess)
-    db.session.commit()
-    return jsonify({"message": "Mess created successfully", "mess_id": new_mess.id}), 201
+    # Use multi-part form data for file uploads
+    data = request.form
+    files = request.files
+    
+    # Validate required fields
+    required_fields = ['title', 'description', 'address', 'locality', 'city', 'state', 'pincode', 'contact_phone']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'message': f'Missing required field: {field}'}), 400
+    
+    try:
+        # Create mess listing
+        new_mess = MessListing(
+            owner_id=current_user.id,
+            title=data['title'],
+            description=data['description'],
+            address=data['address'],
+            locality=data['locality'],
+            city=data['city'],
+            state=data['state'],
+            pincode=data['pincode'],
+            contact_phone=data['contact_phone'],
+            contact_email=data.get('contact_email'),
+            location=f"{data.get('location[lat]', '')},{data.get('location[lng]', '')}"
+        )
+        db.session.add(new_mess)
+        db.session.flush()  # This will assign an ID to the mess listing
+        
+        # Add room details if provided
+        if data.get('rooms'):
+            # Assuming rooms are passed as JSON string
+            import json
+            rooms_data = json.loads(data['rooms'])
+            for room_data in rooms_data:
+                new_room = Room(
+                    mess_id=new_mess.id,
+                    room_type=room_data.get('type', 'single'),
+                    rent=room_data.get('rent', 0),
+                    capacity=room_data.get('capacity', 1),
+                    available_count=room_data.get('available', 1),
+                    total_count=room_data.get('total_count', 1)
+                )
+                db.session.add(new_room)
+        
+        # Handle image uploads
+        if files:
+            # Create upload directory if it doesn't exist
+            import os
+            upload_dir = 'uploads/mess_images'
+            os.makedirs(upload_dir, exist_ok=True)
+            
+            for key, file in files.items():
+                if file:
+                    # Generate unique filename
+                    from werkzeug.utils import secure_filename
+                    import uuid
+                    
+                    # Secure the filename and add a unique identifier
+                    filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
+                    filepath = os.path.join(upload_dir, filename)
+                    
+                    # Save the file
+                    file.save(filepath)
+                    
+                    # Create MessPhoto entry
+                    mess_photo = MessPhoto(
+                        mess_id=new_mess.id,
+                        photo_url=f"/uploads/mess_images/{filename}",
+                        # Set the first image as primary if it's the first one
+                        is_primary=MessPhoto.query.filter_by(mess_id=new_mess.id).count() == 0
+                    )
+                    db.session.add(mess_photo)
+        
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Mess created successfully", 
+            "mess_id": new_mess.id
+        }), 201
+    
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating mess: {str(e)}")  # Log the full error
+        return jsonify({
+            "message": "Failed to create mess listing",
+            "error": str(e)
+        }), 500
 
 @app.route('/api/saved-messes', methods=['POST'])
 @token_required
@@ -184,3 +254,59 @@ def fetch_user(current_user):
         }
     }), 200
 
+@app.route('/api/messes/owner', methods=['GET'])
+@token_required
+def get_owner_messes(current_user):
+    if current_user.user_type != UserType.OWNER:
+        return jsonify({'message': 'Only owners can view their mess listings'}), 403
+    
+    messes = MessListing.query.filter_by(owner_id=current_user.id).all()
+    result = []
+    for mess in messes:
+        # Get primary photo or first photo
+        primary_photo = MessPhoto.query.filter_by(mess_id=mess.id, is_primary=True).first()
+        if not primary_photo:
+            primary_photo = MessPhoto.query.filter_by(mess_id=mess.id).first()
+        
+        # Get room details
+        rooms = []
+        for room in mess.rooms:
+            rooms.append({
+                'type': room.room_type,
+                'price': room.rent,
+                'available': room.available_count,
+                'total': room.total_count
+            })
+        
+        mess_data = {
+            'id': mess.id, 
+            'title': mess.title, 
+            'address': mess.address,
+            'status': 'active' if mess.is_active else 'draft',
+            'imageUrl': primary_photo.photo_url if primary_photo else None,
+            'views': 0,  # You might want to add a views tracking mechanism
+            'inquiries': len(mess.inquiries),
+            'rooms': rooms
+        }
+        result.append(mess_data)
+    
+    return jsonify(result)
+
+
+@app.route('/api/messes/<int:id>', methods=['DELETE'])
+@token_required
+def delete_mess(current_user, id):
+    mess = MessListing.query.filter_by(id=id, owner_id=current_user.id).first()
+    
+    if not mess:
+        return jsonify({'message': 'Mess not found or unauthorized'}), 404
+
+    db.session.delete(mess)
+    db.session.commit()
+    return jsonify({'message': 'Mess deleted successfully'})
+
+
+@app.route('/uploads/<path:filename>')
+def serve_uploaded_file(filename):
+    from flask import send_from_directory
+    return send_from_directory('uploads', filename)
